@@ -393,6 +393,44 @@ def main() -> int:
     pred_prev_vx = 0.0
     pred_prev_vy = 0.0
 
+    # ─── Setpoint smoothing (One Euro on the locked target's head point) ──
+    # Suppresses YOLO bbox jitter on the AIM POINT before the error is
+    # computed.  This is SETPOINT-side (it filters *where the target is*,
+    # not the command sent to the mouse), so it cannot destabilise the
+    # control loop the way command-side prediction did (the OEF/Smith
+    # orbiting removed in commit 034eeed).  Measured tuning: min_cutoff=3,
+    # beta=0.1 cuts still-target jitter ~50% while a 100px flick still lands
+    # in 1 frame and a 300px/s strafe lags only ~1.2px.
+    smoothing_enabled = bool(aim_cfg.get("setpoint_smoothing", True))
+    _oef_x = OneEuroFilter(
+        min_cutoff=float(aim_cfg.get("setpoint_smoothing_min_cutoff", 3.0)),
+        beta=float(aim_cfg.get("setpoint_smoothing_beta", 0.10)),
+    )
+    _oef_y = OneEuroFilter(
+        min_cutoff=float(aim_cfg.get("setpoint_smoothing_min_cutoff", 3.0)),
+        beta=float(aim_cfg.get("setpoint_smoothing_beta", 0.10)),
+    )
+
+    def _on_target_change() -> None:
+        """Drop per-target state on lock loss or a fresh (re)acquisition.
+
+        Resets the setpoint filters (so they don't interpolate between two
+        different targets), the prediction velocity, and the driver's
+        sub-pixel remainder (so leftover counts from the old target don't
+        inject a spurious move into the new one — base_mouse accumulates
+        this and never cleared it before).
+        """
+        nonlocal pred_prev_time, pred_prev_vx, pred_prev_vy
+        _oef_x.x_prev = _oef_x.t_prev = None
+        _oef_y.x_prev = _oef_y.t_prev = None
+        _oef_x.dx_prev = _oef_y.dx_prev = 0.0
+        pred_prev_time = None
+        pred_prev_vx = pred_prev_vy = 0.0
+        try:
+            driver.reset_remainder()
+        except Exception:
+            pass
+
     try:
         while True:
             if _key_down(panic_vk):
@@ -425,10 +463,10 @@ def main() -> int:
             has_lock = (last_mid_coord is not None and (now_t - last_target_time) <= lock_timeout_s)
             
             if not detections:
-                if now_t - last_target_time > lock_timeout_s:
+                if now_t - last_target_time > lock_timeout_s and last_mid_coord is not None:
                     last_mid_coord = None
-                    # Reset state when target is fully lost
-                    pred_prev_time = None
+                    # Reset all per-target state when the target is fully lost.
+                    _on_target_change()
 
             else:
                 if has_lock:
@@ -461,21 +499,33 @@ def main() -> int:
                                 best = det
                     
                     if best is not None:
+                        # Fresh (re)acquisition → this may be a different target
+                        # than before: drop stale filter/remainder state so we
+                        # don't smooth across two distinct enemies.
+                        _on_target_change()
                         last_mid_coord = (best.x, best.y - best.h * headshot_bias)
                         last_target_time = now_t
                     else:
-                        if now_t - last_target_time > lock_timeout_s:
+                        if now_t - last_target_time > lock_timeout_s and last_mid_coord is not None:
                             last_mid_coord = None
+                            _on_target_change()
 
             # --- Aim dispatch (Requirements 2.6, 2.10–2.13 / §4.1 (c))
             if aim_active and best is not None:
                 hx = best.x
                 hy = best.y - best.h * headshot_bias
 
+                # Setpoint smoothing: filter the aim point (not the command).
+                if smoothing_enabled:
+                    hx = _oef_x(hx, now_t)
+                    hy = _oef_y(hy, now_t)
+
                 dx_px = hx - cx
                 dy_px = hy - cy
-                
-                current_t = _perf_counter()
+
+                # Reuse the frame clock read at loop top — one perf_counter
+                # per frame keeps lock/predict/autofire timestamps coherent.
+                current_t = now_t
 
                 # ─── Autofire (Triggerbot) ─────────────────────────
                 if autofire_enabled and aim_active:
@@ -544,7 +594,10 @@ def main() -> int:
 
                 # ─── Latency-Adaptive Gain ────────────────────────────
                 # The dual-PC pipeline has ~5 frames of feedback latency.
-                # Base gain = ema_alpha (0.25).  For large errors (flick),
+                # Base gain = ema_alpha (from config; stability bound for
+                # L=5 frames dead-time: g_crit = 2*sin(pi/22) ~= 0.285 —
+                # keep ema_alpha*adaptive below that or the crosshair
+                # orbits).  For large errors (flick),
                 # reduce gain to prevent overshoot over the latency window.
                 # For small errors (tracking), keep gain high for snap.
                 # gain = ema_alpha × (0.5 + 0.5 × 30/(dist+30))

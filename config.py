@@ -308,7 +308,7 @@ def _log_pixel_to_count(config: Dict[str, Any]) -> None:
 
     info_logger = setup_logger("config.aim", level="INFO")
     info_logger.info(
-        "aim.pixel_to_count=%.4f (capture-px → HID-count scaling, req 2.8)",
+        "aim.pixel_to_count=%.4f (capture-px -> HID-count scaling, req 2.8)",
         float(pixel_to_count),
     )
 

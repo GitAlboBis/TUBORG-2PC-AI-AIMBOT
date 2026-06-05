@@ -125,6 +125,10 @@ MODEL_SEARCH_PATHS = [
     "./models/v11n.pt",
 ]
 
+# NOTE: this mapping matches yolov8m-valorant-detection.onnx. The v11n-416-2
+# models use {0: 'enemy', 1: 'ally'} (see ONNX metadata 'names'). class_name
+# is cosmetic — targeting uses class_id via config target_classes, which MUST
+# be realigned when switching models (v11n: [0], yolov8m: [1]).
 CLASS_NAMES = {
     0: "dropped_spike",
     1: "enemy",

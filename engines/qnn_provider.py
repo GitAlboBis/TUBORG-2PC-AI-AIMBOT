@@ -396,6 +396,32 @@ class QNNProvider:
         opts.enable_mem_pattern = True
         opts.enable_cpu_mem_arena = True
 
+        # 6b) QNN context-binary cache (EPContext). The HTP graph
+        # finalize/compile dominates session creation (~1.9s for yolo11n,
+        # ~7.5s for yolov8m, measured). With a cached context the load drops
+        # to ~0.3s. If a fresh cache exists next to the model, load from it;
+        # otherwise compile from the source model and ask ORT to dump the
+        # context for the next startup. NOTE: these are SessionOptions
+        # config entries, NOT provider_options keys.
+        ctx_path = os.path.splitext(self.model_path)[0] + "_ctx.onnx"
+        session_model_path = self.model_path
+        try:
+            ctx_is_fresh = (
+                os.path.exists(ctx_path)
+                and os.path.getmtime(ctx_path) >= os.path.getmtime(self.model_path)
+            )
+        except OSError:
+            ctx_is_fresh = False
+        if ctx_is_fresh:
+            session_model_path = ctx_path
+        else:
+            try:
+                opts.add_session_config_entry("ep.context_enable", "1")
+                opts.add_session_config_entry("ep.context_file_path", ctx_path)
+                opts.add_session_config_entry("ep.context_embed_mode", "1")
+            except Exception as e:  # noqa: BLE001 — older ORT without EPContext
+                logger.info("EPContext cache unavailable (%s); plain load", e)
+
         # ORT 1.20+ plugin-EP API: register QNN against the discovered NPU
         # device(s) BEFORE constructing the session. ``provider_options`` is a
         # ``dict[str, str]`` here per ``add_provider_for_devices``'s mapping
@@ -428,25 +454,48 @@ class QNNProvider:
         # 7) Construct session. Single broad except branch covers Reqs 1.6, 6.2, 6.3 —
         #    we never re-raise out of load(); EP_Selector matches "no NPU detected" on
         #    the logged message text.
-        try:
+        def _make_session(path):
             if legacy_providers is not None:
-                session = ort.InferenceSession(
-                    self.model_path,
+                return ort.InferenceSession(
+                    path,
                     sess_options=opts,
                     providers=legacy_providers,
                 )
-            else:
-                # ORT 1.20+ plugin-EP path — providers were already bound via
-                # opts.add_provider_for_devices above. Passing ``providers=``
-                # again would override that binding.
-                session = ort.InferenceSession(
-                    self.model_path,
-                    sess_options=opts,
-                )
+            # ORT 1.20+ plugin-EP path — providers were already bound via
+            # opts.add_provider_for_devices above. Passing ``providers=``
+            # again would override that binding.
+            return ort.InferenceSession(path, sess_options=opts)
+
+        try:
+            session = _make_session(session_model_path)
         except Exception as e:  # noqa: BLE001 — broad-by-design per Req 1.6
-            logger.error("QNN InferenceSession creation failed: %s", e)
-            self.session = None
-            return False
+            if session_model_path != self.model_path:
+                # Stale/incompatible context cache (e.g. QNN SDK update):
+                # drop it and recompile from the source model.
+                logger.warning(
+                    "QNN context cache load failed (%s); recompiling from %s",
+                    e, self.model_path,
+                )
+                try:
+                    os.remove(ctx_path)
+                except OSError:
+                    pass
+                try:
+                    opts.add_session_config_entry("ep.context_enable", "1")
+                    opts.add_session_config_entry("ep.context_file_path", ctx_path)
+                    opts.add_session_config_entry("ep.context_embed_mode", "1")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    session = _make_session(self.model_path)
+                except Exception as e2:  # noqa: BLE001
+                    logger.error("QNN InferenceSession creation failed: %s", e2)
+                    self.session = None
+                    return False
+            else:
+                logger.error("QNN InferenceSession creation failed: %s", e)
+                self.session = None
+                return False
 
         # 8) Probe I/O metadata.
         try:

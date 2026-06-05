@@ -5,9 +5,9 @@ ai_engine:
   execution_provider: auto
   headshot_bias: 0.40
   iou_threshold: 0.45
-  model_path: ./models/yolov8m-valorant-detection.onnx
+  model_path: ./models/v11n-416-2.onnx  # yolo11n: ~3.1ms vs ~7.9ms di yolov8m su NPU (misurato)
   target_classes:
-  - 1
+  - 0  # ATTENZIONE: v11n = {0: enemy, 1: ally}; yolov8m = {1: enemy}. Cambiando modello, riallineare!
 aim:
 
   deadzone_px: 2.0
@@ -20,12 +20,15 @@ aim:
   cx_counts_per_2pi: 1657.8639905405767  # calibrated by tools/calibrate_cx.py
   lock_radius_px: 120.0
   lock_timeout_s: 1.0
-  ema_alpha: 0.35 # base gain — adaptive curve reduces for flicks. Safe: 0.20-0.40
+  ema_alpha: 0.22 # base gain. La latenza di feedback L~5 frame è dominata dalla capture card (NON dall'inferenza), quindi cambiare modello non sposta g_crit≈0.285. 0.22 resta sotto soglia anche in ADS (0.22/0.8=0.275<0.285). Non superare ~0.22 finché ads_multiplier non è verificato.
+  setpoint_smoothing: true             # One Euro sulla posizione-testa del target (riduce jitter detector ~50%, setpoint-side: non causa orbiting)
+  setpoint_smoothing_min_cutoff: 3.0   # Hz; più alto = meno lag, meno smoothing
+  setpoint_smoothing_beta: 0.10        # quanto il cutoff si apre con la velocità (più alto = segue meglio i target veloci)
   disable_prediction: true
   prediction_interval: 1.2
   autofire_enabled: false
   autofire_tolerance_px: 10.0
-  autofire_cooldown_s: 0.15
+  autofire_cooldown_s: 0.20
 
   ads_multiplier: 0.8  # ratio = ADS_sens / hipfire_sens = 0.4 / 0.5
 capture:
